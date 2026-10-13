@@ -20,10 +20,10 @@
         "doctrine/instantiator": "^1.0"
     },
     "autoload": {
-        "psr-4": {
-            "Firebird\\": "src/Firebird/",
-            "Firebird\\Support\\": "Support/"
-        }
+        "classmap": [
+            "src/",
+            "Support/"
+        ]
     },
     "extra": {
         "laravel": {
