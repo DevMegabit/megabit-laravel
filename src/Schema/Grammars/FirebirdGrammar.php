@@ -23,13 +23,78 @@ class FirebirdGrammar extends Grammar
     protected $serials = ['bigInteger', 'integer', 'mediumInteger', 'smallInteger', 'tinyInteger'];
 
     /**
-     * Compile the query to determine if a table exists.
+     * Compile the query to determine if the given table exists.
      *
+     * @param  string|null  $schema
+     * @param  string  $table
      * @return string
      */
-    public function compileTableExists()
+    public function compileTableExists($schema, $table)
     {
-        return 'SELECT * FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ?';
+        return sprintf(
+            'select case when exists (select 1 from rdb$relations where rdb$relation_name = %s and '
+            .'rdb$relation_type = 0 and (rdb$system_flag is null or rdb$system_flag = 0)) then 1 else 0 end '
+            .'as "exists" from rdb$database',
+            $this->quoteString($table),
+        );
+    }
+
+    /**
+     * Compile the query to determine the tables.
+     *
+     * @param  string|string[]|null  $schema
+     * @return string
+     */
+    public function compileTables($schema)
+    {
+        return 'select trim(trailing from rdb$relation_name) as "name" '
+            .'from rdb$relations '
+            .'where rdb$relation_type = 0 '
+            .'and (rdb$system_flag is null or rdb$system_flag = 0) '
+            .'order by rdb$relation_name';
+    }
+
+    /**
+     * Compile the query to determine the columns.
+     *
+     * @param  string|null  $schema
+     * @param  string  $table
+     * @return string
+     */
+    public function compileColumns($schema, $table)
+    {
+        return sprintf(
+            'select trim(trailing from rdb$field_name) as "name" '
+            .'from rdb$relation_fields where rdb$relation_name = %s '
+            .'order by rdb$field_position',
+            $this->quoteString($table),
+        );
+    }
+
+    /**
+     * Compile the query to determine the indexes.
+     *
+     * Megabit: not present upstream (Schema::getIndexes / hasIndex). One row
+     * per index column, in order; FirebirdProcessor::processIndexes groups them.
+     *
+     * @param  string|null  $schema
+     * @param  string  $table
+     * @return string
+     */
+    public function compileIndexes($schema, $table)
+    {
+        return sprintf(
+            'select trim(trailing from i.rdb$index_name) as "name", '
+            .'trim(trailing from s.rdb$field_name) as "column", '
+            .'coalesce(i.rdb$unique_flag, 0) as "unique", '
+            .'trim(trailing from rc.rdb$constraint_type) as "constraint" '
+            .'from rdb$indices i '
+            .'join rdb$index_segments s on s.rdb$index_name = i.rdb$index_name '
+            .'left join rdb$relation_constraints rc on rc.rdb$index_name = i.rdb$index_name '
+            .'where i.rdb$relation_name = %s '
+            .'order by i.rdb$index_name, s.rdb$field_position',
+            $this->quoteString($table),
+        );
     }
 
     /**
@@ -40,18 +105,7 @@ class FirebirdGrammar extends Grammar
      */
     public function compileColumnListing($table)
     {
-        return 'SELECT TRIM(RDB$FIELD_NAME) AS "column_name" '
-            . "FROM RDB\$RELATION_FIELDS WHERE RDB\$RELATION_NAME = '$table'";
-    }
-
-    /**
-     * Compile the query to determine if a sequence exists.
-     *
-     * @return string
-     */
-    public function compileSequenceExists()
-    {
-        return 'SELECT * FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ?';
+        return "select trim(rdb\$field_name) as \"column_name\" from rdb\$relation_fields where rdb\$relation_name = '$table'";
     }
 
     /**
@@ -63,19 +117,13 @@ class FirebirdGrammar extends Grammar
      */
     public function compileCreate(Blueprint $blueprint, Fluent $command)
     {
+        if ($blueprint->temporary) {
+            throw new \LogicException('This database driver does not support temporary tables.');
+        }
+
         $columns = implode(', ', $this->getColumns($blueprint));
 
-        $sql = $blueprint->temporary ? 'CREATE TEMPORARY' : 'CREATE';
-
-        $sql .= ' TABLE ' . $this->wrapTable($blueprint) . " ($columns)";
-
-        if ($blueprint->temporary) {
-            if ($blueprint->preserve) {
-                $sql .= ' ON COMMIT DELETE ROWS';
-            } else {
-                $sql .= ' ON COMMIT PRESERVE ROWS';
-            }
-        }
+        $sql = 'create table '.$this->wrapTable($blueprint)." ($columns)";
 
         return $sql;
     }
@@ -89,7 +137,24 @@ class FirebirdGrammar extends Grammar
      */
     public function compileDrop(Blueprint $blueprint, Fluent $command)
     {
-        return 'DROP TABLE ' . $this->wrapTable($blueprint);
+        return 'drop table '.$this->wrapTable($blueprint);
+    }
+
+    /**
+     * Compile a drop table (if exists) command.
+     *
+     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
+     * @param  \Illuminate\Support\Fluent  $command
+     * @return string
+     */
+    public function compileDropIfExists(Blueprint $blueprint, Fluent $command)
+    {
+        return sprintf(
+            'execute block as begin if (exists(select 1 from rdb$relations where rdb$relation_name = %s and rdb$relation_type = 0 and '
+            .'(rdb$system_flag is null or rdb$system_flag = 0))) then execute statement \'drop table %s\'; end',
+            $this->quoteString($blueprint->getTable()),
+            $this->wrapTable($blueprint)
+        );
     }
 
     /**
@@ -105,7 +170,7 @@ class FirebirdGrammar extends Grammar
 
         $columns = $this->prefixArray('ADD', $this->getColumns($blueprint));
 
-        return 'ALTER TABLE ' . $table . ' ' . implode(', ', $columns);
+        return 'ALTER TABLE '.$table.' '.implode(', ', $columns);
     }
 
     /**
@@ -119,7 +184,40 @@ class FirebirdGrammar extends Grammar
     {
         $columns = $this->columnize($command->columns);
 
-        return 'ALTER TABLE ' . $this->wrapTable($blueprint) . " ADD PRIMARY KEY ({$columns})";
+        // Megabit: keep the requested constraint name (Firebird 3 limit: 31).
+        $name = $command->index ? ' CONSTRAINT '.$this->wrap(substr($command->index, 0, 31)) : '';
+
+        return 'ALTER TABLE '.$this->wrapTable($blueprint)." ADD{$name} PRIMARY KEY ({$columns})";
+    }
+
+    /**
+     * Compile a drop column command.
+     *
+     * Megabit: not present upstream.
+     *
+     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
+     * @param  \Illuminate\Support\Fluent  $command
+     * @return string
+     */
+    public function compileDropColumn(Blueprint $blueprint, Fluent $command)
+    {
+        $columns = $this->prefixArray('DROP', $this->wrapArray($command->columns));
+
+        return 'ALTER TABLE '.$this->wrapTable($blueprint).' '.implode(', ', $columns);
+    }
+
+    /**
+     * Compile a drop index command.
+     *
+     * Megabit: not present upstream.
+     *
+     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
+     * @param  \Illuminate\Support\Fluent  $command
+     * @return string
+     */
+    public function compileDropIndex(Blueprint $blueprint, Fluent $command)
+    {
+        return 'DROP INDEX '.$this->wrap(substr($command->index, 0, 31));
     }
 
     /**
@@ -187,11 +285,11 @@ class FirebirdGrammar extends Grammar
         // Once we have the basic foreign key creation statement constructed we can
         // build out the syntax for what should happen on an update or delete of
         // the affected columns, which will get something like "cascade", etc.
-        if (!is_null($command->onDelete)) {
+        if (! is_null($command->onDelete)) {
             $sql .= " ON DELETE {$command->onDelete}";
         }
 
-        if (!is_null($command->onUpdate)) {
+        if (! is_null($command->onUpdate)) {
             $sql .= " ON UPDATE {$command->onUpdate}";
         }
 
@@ -213,6 +311,26 @@ class FirebirdGrammar extends Grammar
     }
 
     /**
+     * Get the SQL for an auto-increment column modifier.
+     *
+     * Megabit: upstream lists "Increment" but has no method, so the column is
+     * created without a generator and Laravel's own "migrations" table fails
+     * with a null "id". IDENTITY exists since Firebird 3.0.
+     *
+     * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
+     * @param  \Illuminate\Support\Fluent  $column
+     * @return string|null
+     */
+    protected function modifyIncrement(Blueprint $blueprint, Fluent $column)
+    {
+        if (in_array($column->type, $this->serials) && $column->autoIncrement) {
+            return ' GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY';
+        }
+
+        return null;
+    }
+
+    /**
      * Get the SQL for a character set column modifier.
      *
      * @param  \Illuminate\Database\Schema\Blueprint  $blueprint
@@ -221,8 +339,8 @@ class FirebirdGrammar extends Grammar
      */
     protected function modifyCharset(Blueprint $blueprint, Fluent $column)
     {
-        if (!is_null($column->charset)) {
-            return ' CHARACTER SET ' . $column->charset;
+        if (! is_null($column->charset)) {
+            return ' CHARACTER SET '.$column->charset;
         }
     }
 
@@ -235,8 +353,8 @@ class FirebirdGrammar extends Grammar
      */
     protected function modifyCollate(Blueprint $blueprint, Fluent $column)
     {
-        if (!is_null($column->collation)) {
-            return ' COLLATE ' . $column->collation;
+        if (! is_null($column->collation)) {
+            return ' COLLATE '.$column->collation;
         }
     }
 
@@ -261,23 +379,8 @@ class FirebirdGrammar extends Grammar
      */
     protected function modifyDefault(Blueprint $blueprint, Fluent $column)
     {
-        if (!is_null($column->default)) {
-            return ' DEFAULT ' . $this->getDefaultValue($column->default);
-        }
-    }
-
-    /**
-     * Get the SQL for an auto-increment column modifier.
-     *
-     * @param \Illuminate\Database\Schema\Blueprint $blueprint
-     * @param \Illuminate\Support\Fluent $column
-     * @return string|null
-     */
-    protected function modifyIncrement(Blueprint $blueprint, Fluent $column)
-    {
-        if (in_array($column->type, $this->serials) && $column->autoIncrement) {
-            // identity columns support beginning Firebird 3.0 and above
-            return $blueprint->use_identity ? ' GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY' : ' PRIMARY KEY';
+        if (! is_null($column->default)) {
+            return ' DEFAULT '.$this->getDefaultValue($column->default);
         }
     }
 
@@ -337,7 +440,7 @@ class FirebirdGrammar extends Grammar
     }
 
     /**
-     * Create the column definition for a integer type.
+     * Create the column definition for an integer type.
      *
      * @param  \Illuminate\Support\Fluent  $column
      * @return string
@@ -436,7 +539,7 @@ class FirebirdGrammar extends Grammar
     }
 
     /**
-     * Create the column definition for an enum type.
+     * Create the column definition for an enumeration type.
      *
      * @param  \Illuminate\Support\Fluent  $column
      * @return string
@@ -444,10 +547,10 @@ class FirebirdGrammar extends Grammar
     protected function typeEnum(Fluent $column)
     {
         $allowed = array_map(function ($a) {
-            return "'" . $a . "'";
+            return "'".$a."'";
         }, $column->allowed);
 
-        return "VARCHAR(255) CHECK (\"{$column->name}\" IN (" . implode(', ', $allowed) . '))';
+        return "VARCHAR(255) CHECK (\"{$column->name}\" IN (".implode(', ', $allowed).'))';
     }
 
     /**
@@ -495,7 +598,7 @@ class FirebirdGrammar extends Grammar
     }
 
     /**
-     * Create the column definition for a date-time type.
+     * Create the column definition for a date-time (with time zone) type.
      *
      * @param  \Illuminate\Support\Fluent  $column
      * @return string
@@ -518,7 +621,7 @@ class FirebirdGrammar extends Grammar
     }
 
     /**
-     * Create the column definition for a time type.
+     * Create the column definition for a time (with time zone) type.
      *
      * @param  \Illuminate\Support\Fluent  $column
      * @return string
@@ -545,7 +648,7 @@ class FirebirdGrammar extends Grammar
     }
 
     /**
-     * Create the column definition for a timestamp type.
+     * Create the column definition for a timestamp (with time zone) type.
      *
      * @param  \Illuminate\Support\Fluent  $column
      * @return string
@@ -598,159 +701,5 @@ class FirebirdGrammar extends Grammar
     protected function typeMacAddress(Fluent $column)
     {
         return 'VARCHAR(17)';
-    }
-
-
-    /**
-     * Compile a create sequence command.
-     *
-     * @param \Firebird\Schema\SequenceBlueprint $blueprint
-     * @param \Illuminate\Support\Fluent $command
-     * @return string
-     */
-    public function compileCreateSequence(SequenceBlueprint $blueprint, Fluent $command)
-    {
-        $sql = 'CREATE SEQUENCE ';
-        $sql .= $this->wrapSequence($blueprint);
-        if ($blueprint->getInitialValue() !== 0) {
-            $sql .= ' START WITH ' . $blueprint->getInitialValue();
-        }
-        if ($blueprint->getIncrement() !== 1) {
-            $sql .= ' INCREMENT BY ' . $blueprint->getIncrement();
-        }
-        return $sql;
-    }
-
-    /**
-     * Compile a create sequence command for table.
-     *
-     * @param \Illuminate\Database\Schema\Blueprint $blueprint
-     * @param \Illuminate\Support\Fluent $command
-     * @return string
-     */
-    public function compileSequenceForTable(Blueprint $blueprint, Fluent $command)
-    {
-
-        $sequence = $this->wrap(substr('seq_' . $blueprint->getTable(), 0, 31));
-
-        return "CREATE SEQUENCE {$sequence}";
-    }
-
-    /**
-     * Compile a drop sequence command for table.
-     *
-     * @param \Illuminate\Database\Schema\Blueprint $blueprint
-     * @param \Illuminate\Support\Fluent $command
-     * @return string
-     */
-    public function compileDropSequenceForTable(Blueprint $blueprint, Fluent $command)
-    {
-        $sequenceName = substr('seq_' . $blueprint->getTable(), 0, 31);
-        $sequence = $this->wrap($sequenceName);
-
-        $sql = 'EXECUTE BLOCK' . "\n";
-        $sql .= 'AS' . "\n";
-        $sql .= 'BEGIN' . "\n";
-        $sql .= "  IF (EXISTS(SELECT * FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_NAME = '{$sequenceName}')) THEN" . "\n";
-        $sql .= "    EXECUTE STATEMENT 'DROP SEQUENCE {$sequence}';" . "\n";
-        $sql .= 'END';
-        return $sql;
-    }
-
-    /**
-     * Compile a create trigger for support autoincrement.
-     *
-     * @param \Illuminate\Database\Schema\Blueprint $blueprint
-     * @param \Illuminate\Support\Fluent $command
-     * @return string
-     */
-    public function compileTriggerForAutoincrement(Blueprint $blueprint, Fluent $command)
-    {
-        $table = $this->wrapTable($blueprint);
-        $trigger = $this->wrap(substr('tr_' . $blueprint->getTable() . '_bi', 0, 31));
-        $column = $this->wrap($command->columnname);
-        $sequence = $this->wrap(substr('seq_' . $blueprint->getTable(), 0, 31));
-
-        $sql = "CREATE OR ALTER TRIGGER {$trigger} FOR {$table}\n";
-        $sql .= "ACTIVE BEFORE INSERT\n";
-        $sql .= "AS\n";
-        $sql .= "BEGIN\n";
-        $sql .= "  IF (NEW.{$column} IS NULL) THEN \n";
-        $sql .= "    NEW.{$column} = NEXT VALUE FOR {$sequence};\n";
-        $sql .= 'END';
-
-        return $sql;
-    }
-
-    /**
-     * Compile a alter sequence command.
-     *
-     * @param \Firebird\Schema\SequenceBlueprint $blueprint
-     * @param \Illuminate\Support\Fluent $command
-     * @return string
-     */
-    public function compileAlterSequence(SequenceBlueprint $blueprint, Fluent $command)
-    {
-        $sql = 'ALTER SEQUENCE ';
-        $sql .= $this->wrapSequence($blueprint);
-        if ($blueprint->isRestart()) {
-            $sql .= ' RESTART';
-            if ($blueprint->getInitialValue() !== null) {
-                $sql .= ' WITH ' . $blueprint->getInitialValue();
-            }
-        }
-        if ($blueprint->getIncrement() !== 1) {
-            $sql .= ' INCREMENT BY ' . $blueprint->getIncrement();
-        }
-        return $sql;
-    }
-
-    /**
-     * Compile a drop sequence command.
-     *
-     * @param \Firebird\Schema\SequenceBlueprint $blueprint
-     * @param \Illuminate\Support\Fluent $command
-     * @return string
-     */
-    public function compileDropSequence(SequenceBlueprint $blueprint, Fluent $command)
-    {
-        return 'DROP SEQUENCE ' . $this->wrapSequence($blueprint);
-    }
-
-    /**
-     * Compile a drop sequence command.
-     *
-     * @param \Firebird\Schema\SequenceBlueprint $blueprint
-     * @param \Illuminate\Support\Fluent $command
-     * @return string
-     */
-    public function compileDropSequenceIfExists(SequenceBlueprint $blueprint, Fluent $command)
-    {
-        $sql = 'EXECUTE BLOCK' . "\n";
-        $sql .= 'AS' . "\n";
-        $sql .= 'BEGIN' . "\n";
-        $sql .= "  IF (EXISTS(SELECT * FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_NAME = '" . $blueprint->getSequence() . "')) THEN" . "\n";
-        $sql .= "    EXECUTE STATEMENT 'DROP SEQUENCE " . $this->wrapSequence($blueprint) . "';" . "\n";
-        $sql .= 'END';
-        return $sql;
-    }
-
-    /**
-     * Wrap a sequence in keyword identifiers.
-     *
-     * @param mixed $sequence
-     * @return string
-     */
-    public function wrapSequence($sequence)
-    {
-        if ($sequence instanceof SequenceBlueprint) {
-            $sequence = $sequence->getSequence();
-        }
-
-        if ($this->isExpression($sequence)) {
-            return $this->getValue($sequence);
-        }
-
-        return $this->wrap($this->tablePrefix . $sequence, true);
     }
 }

@@ -1,31 +1,46 @@
 {
+    "$schema": "https://getcomposer.org/schema.json",
     "name": "devmegabit/megabit-laravel",
-    "description": "A Firebird database package for the Laravel Framework",
+    "description": "Firebird database driver for Laravel 12 and 13, with migrations on Firebird 3, 4 and 5",
     "license": "MIT",
     "authors": [
         {
-            "name": "Megabit Software LTDA",
-            "email": "desenvolvimento.megabit@gmail.com"
+            "name": "Megabit Software LTDA"
         }
     ],
-    "prefer-stable": true,
-    "minimum-stability": "dev",
     "require": {
-        "php": "^7.2.0",
+        "php": "^8.2",
         "ext-pdo": "*",
-        "illuminate/support": "~5.5.0|~5.6.0|~5.7.0|~5.8.0|^6.0|^7.0|^8.0",
-        "illuminate/container": "~5.5.0|~5.6.0|~5.7.0|~5.8.0|^6.0|^7.0|^8.0",
-        "illuminate/database": "~5.5.0|~5.6.0|~5.7.0|~5.8.0|^6.0|^7.0|^8.0",
-        "illuminate/events": "~5.5.0|~5.6.0|~5.7.0|~5.8.0|^6.0|^7.0|^8.0",
-        "doctrine/instantiator": "^1.0"
+        "illuminate/support": "^12.17|^13.0",
+        "illuminate/container": "^12.17|^13.0",
+        "illuminate/database": "^12.17|^13.0",
+        "illuminate/events": "^12.17|^13.0"
     },
-    "autoload": {
-        "classmap": [
-            "src/",
-            "Support/"
+    "require-dev": {
+        "mockery/mockery": "^1.6",
+        "phpunit/phpunit": "^11.5|^12.0",
+        "orchestra/testbench": "^10.3|^11.0",
+        "fakerphp/faker": "^1.24"
+    },
+    "archive": {
+        "exclude": [
+            "/tests"
         ]
     },
+    "autoload": {
+        "psr-4": {
+            "Firebird\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Firebird\\Tests\\": "tests/"
+        }
+    },
     "extra": {
+        "branch-alias": {
+            "dev-2.x": "2.x-dev"
+        },
         "laravel": {
             "providers": [
                 "Firebird\\FirebirdServiceProvider"
