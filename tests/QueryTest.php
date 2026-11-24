@@ -1474,7 +1474,10 @@ class QueryTest extends TestCase
         // Check the starting id is the lowest id.
         $this->assertEquals($startingId, $users->min('id'));
 
+        // Megabit: without ORDER BY the row order is not guaranteed (it
+        // changes on Firebird 3 after the deletes of earlier tests).
         $results = DB::table('users')
+            ->orderBy('id')
             ->offset($offset = 3)
             ->get();
 

@@ -58,7 +58,9 @@ class MigrationTest extends TestCase
 
         $constraint = DB::selectOne("SELECT TRIM(RDB\$CONSTRAINT_NAME) AS N FROM RDB\$RELATION_CONSTRAINTS WHERE RDB\$RELATION_NAME = 'MB_RUC' AND RDB\$CONSTRAINT_TYPE = 'PRIMARY KEY'");
         $this->assertSame('MB_RUC_PK', $constraint->N);
-        $this->assertTrue(Schema::hasIndex('MB_RUC', 'MB_RUC_IDX_NOME'));
+        // getIndexes() returns lower-case names, like the other drivers; Laravel
+        // 13's hasIndex() lower-cases the argument, Laravel 12's does not.
+        $this->assertTrue(Schema::hasIndex('MB_RUC', 'mb_ruc_idx_nome'));
         $this->assertTrue(Schema::hasIndex('MB_RUC', ['RUC', 'DV'], 'primary'));
         $this->assertFalse(Schema::hasIndex('MB_RUC', ['NOME'], 'unique'));
 
@@ -71,7 +73,7 @@ class MigrationTest extends TestCase
         Schema::table('MB_RUC', fn (Blueprint $table) => $table->dropIndex('MB_RUC_IDX_NOME'));
 
         $this->assertFalse(Schema::hasColumn('MB_RUC', 'PORTE'));
-        $this->assertFalse(Schema::hasIndex('MB_RUC', 'MB_RUC_IDX_NOME'));
+        $this->assertFalse(Schema::hasIndex('MB_RUC', 'mb_ruc_idx_nome'));
         $this->assertSame('Ñandutí', DB::table('MB_RUC')->value('NOME'));
     }
 }
